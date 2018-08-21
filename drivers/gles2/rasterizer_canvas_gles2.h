@@ -80,11 +80,17 @@ public:
 
 		GLuint primitive;
 		GLuint texture;
+
+		RasterizerCanvas::Item *item_from;
+		int command_from;
+		RasterizerCanvas::Item *item_to;
+		int command_to;
+
+		RasterizerStorageGLES2::Material *material;
 	} data;
 
 	struct State {
 		Uniforms uniforms;
-		Uniforms prev_uniforms;
 
 		bool tiled;
 
@@ -135,6 +141,8 @@ public:
 	_FORCE_INLINE_ void _copy_texscreen(const Rect2 &p_rect);
 
 	virtual void canvas_render_items(Item *p_item_list, int p_z, const Color &p_modulate, Light *p_light, const Transform2D &p_base_transform);
+	void _canvas_render_items(Item *p_item_list, int p_z, const Color &p_modulate, Light *p_light, const Transform2D &p_base_transform);
+	void _render_items(Item *p_item_from, const int p_command_from, Item *p_item_to, const int p_command_to);
 	virtual void canvas_debug_viewport_shadows(Light *p_lights_with_shadow);
 
 	virtual void canvas_light_shadow_buffer_update(RID p_buffer, const Transform2D &p_light_xform, int p_light_mask, float p_near, float p_far, LightOccluderInstance *p_occluders, CameraMatrix *p_xform_cache);
@@ -152,6 +160,30 @@ public:
 	virtual void draw_window_margins(int *black_margin, RID *black_image);
 
 	RasterizerCanvasGLES2();
+
+	struct RenderCommand {
+		RasterizerCanvas::Item* item;
+		int command;
+
+		GLuint primitive;
+
+		uint32_t vertex_offset;
+		uint32_t vertex_count;
+
+		uint32_t index_offset;
+		uint32_t index_count;
+	};
+
+	struct RenderCommands {
+		uint32_t index;
+		uint32_t size;
+		RenderCommand commands[1024];
+
+		RenderCommands() {
+			index = 0;
+			size = 1024;
+		}
+	} render_commands;
 };
 
 #endif // RASTERIZERCANVASGLES2_H

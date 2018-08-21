@@ -27,9 +27,9 @@
 /* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE     */
 /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                */
 /*************************************************************************/
-#include "rasterizer_canvas_gles2.h"
 #include "os/os.h"
 #include "project_settings.h"
+#include "rasterizer_canvas_gles2.h"
 #include "rasterizer_scene_gles2.h"
 #include "servers/visual/visual_server_raster.h"
 #ifndef GLES_OVER_GL
@@ -69,7 +69,7 @@ void RasterizerCanvasGLES2::_set_uniforms() {
 }
 
 void RasterizerCanvasGLES2::canvas_begin() {
-	data.primitive = GL_TRIANGLES;
+	data.primitive = -1;
 	data.texture = GL_NONE;
 
 	state.canvas_shader.bind();
@@ -130,7 +130,6 @@ void RasterizerCanvasGLES2::canvas_begin() {
 	state.uniforms.extra_matrix = Transform2D();
 
 	_set_uniforms();
-	state.prev_uniforms = state.uniforms;
 }
 
 void RasterizerCanvasGLES2::canvas_end() {
@@ -187,7 +186,7 @@ RasterizerStorageGLES2::Texture *RasterizerCanvasGLES2::_bind_canvas_texture(con
 	}
 
 	if (data.texture != newtexid) {
-		_flush();
+		//_flush();
 
 		glActiveTexture(GL_TEXTURE0);
 		glBindTexture(GL_TEXTURE_2D, newtexid);
@@ -251,11 +250,6 @@ void RasterizerCanvasGLES2::_canvas_item_render_commands(Item *p_item, Item *cur
 	for (int i = 0; i < command_count; i++) {
 
 		Item::Command *command = commands[i];
-
-		if (command->type != Item::Command::TYPE_RECT && state.tiled) {
-			_flush();
-			_untile();
-		}
 
 		switch (command->type) {
 
@@ -366,7 +360,7 @@ void RasterizerCanvasGLES2::_canvas_item_render_commands(Item *p_item, Item *cur
 					const bool tiled = r->flags & CANVAS_RECT_TILE && !(tex->flags & VS::TEXTURE_FLAG_REPEAT);
 
 					if (tiled != state.tiled) {
-						_flush();
+						//_flush();
 
 						if (tiled) {
 							glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
@@ -843,7 +837,709 @@ void RasterizerCanvasGLES2::_copy_texscreen(const Rect2 &p_rect) {
 }
 
 void RasterizerCanvasGLES2::canvas_render_items(Item *p_item_list, int p_z, const Color &p_modulate, Light *p_light, const Transform2D &p_base_transform) {
+	Item *from_item = p_item_list;
+	int from_index = 0;
 
+	data.item_from = p_item_list;
+	data.command_from = 0;
+
+	Item *current_clip = NULL;
+
+	RasterizerStorageGLES2::Shader *shader_cache = NULL;
+
+	bool rebind_shader = true;
+
+	Size2 rt_size = Size2(storage->frame.current_rt->width, storage->frame.current_rt->height);
+
+	state.current_tex = RID();
+	state.current_tex_ptr = NULL;
+	state.current_normal = RID();
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, storage->resources.white_tex);
+	data.texture = storage->resources.white_tex;
+
+	int last_blend_mode = -1;
+
+	RID canvas_last_material = RID();
+
+	while (p_item_list) {
+		data.item_to = p_item_list;
+
+		Item *ci = p_item_list;
+
+		Item *material_owner = ci->material_owner ? ci->material_owner : ci;
+
+		if (current_clip != ci->final_clip_owner) {
+			current_clip = ci->final_clip_owner;
+
+			if (current_clip) {
+				glEnable(GL_SCISSOR_TEST);
+				int y = storage->frame.current_rt->height - (current_clip->final_clip_rect.position.y + current_clip->final_clip_rect.size.y);
+				if (storage->frame.current_rt->flags[RasterizerStorage::RENDER_TARGET_VFLIP])
+					y = current_clip->final_clip_rect.position.y;
+				glScissor(current_clip->final_clip_rect.position.x, y, current_clip->final_clip_rect.size.width, current_clip->final_clip_rect.size.height);
+			} else {
+				glDisable(GL_SCISSOR_TEST);
+			}
+		}
+
+		// TODO: copy back buffer
+
+		if (ci->copy_back_buffer) {
+			if (ci->copy_back_buffer->full) {
+				_copy_texscreen(Rect2());
+			} else {
+				_copy_texscreen(ci->copy_back_buffer->rect);
+			}
+		}
+
+		RID material = material_owner->material;
+		RasterizerStorageGLES2::Material *material_ptr = storage->material_owner.getornull(material);
+
+		if (material != canvas_last_material || rebind_shader) {
+
+			RasterizerStorageGLES2::Shader *shader_ptr = NULL;
+
+			if (material_ptr) {
+				shader_ptr = material_ptr->shader;
+
+				if (shader_ptr && shader_ptr->mode != VS::SHADER_CANVAS_ITEM) {
+					shader_ptr = NULL; // not a canvas item shader, don't use.
+				}
+			}
+
+			if (shader_ptr) {
+				if (shader_ptr->canvas_item.uses_screen_texture) {
+					_copy_texscreen(Rect2());
+				}
+
+				if (shader_ptr != shader_cache) {
+
+					if (shader_ptr->canvas_item.uses_time) {
+						VisualServerRaster::redraw_request();
+					}
+
+					state.canvas_shader.set_custom_shader(shader_ptr->custom_code_id);
+					state.canvas_shader.bind();
+				}
+
+				int tc = material_ptr->textures.size();
+				Pair<StringName, RID> *textures = material_ptr->textures.ptrw();
+
+				ShaderLanguage::ShaderNode::Uniform::Hint *texture_hints = shader_ptr->texture_hints.ptrw();
+
+				for (int i = 0; i < tc; i++) {
+
+					glActiveTexture(GL_TEXTURE2 + i);
+
+					RasterizerStorageGLES2::Texture *t = storage->texture_owner.getornull(textures[i].second);
+
+					if (!t) {
+
+						switch (texture_hints[i]) {
+							case ShaderLanguage::ShaderNode::Uniform::HINT_BLACK_ALBEDO:
+							case ShaderLanguage::ShaderNode::Uniform::HINT_BLACK: {
+								glBindTexture(GL_TEXTURE_2D, storage->resources.black_tex);
+							} break;
+							case ShaderLanguage::ShaderNode::Uniform::HINT_ANISO: {
+								glBindTexture(GL_TEXTURE_2D, storage->resources.aniso_tex);
+							} break;
+							case ShaderLanguage::ShaderNode::Uniform::HINT_NORMAL: {
+								glBindTexture(GL_TEXTURE_2D, storage->resources.normal_tex);
+							} break;
+							default: {
+								glBindTexture(GL_TEXTURE_2D, storage->resources.white_tex);
+							} break;
+						}
+
+						continue;
+					}
+
+					t = t->get_ptr();
+
+					if (t->redraw_if_visible) {
+						VisualServerRaster::redraw_request();
+					}
+
+					glBindTexture(t->target, t->tex_id);
+				}
+
+			} else {
+				state.canvas_shader.set_custom_shader(0);
+				state.canvas_shader.bind();
+			}
+			state.canvas_shader.use_material((void *)material_ptr);
+
+			shader_cache = shader_ptr;
+
+			canvas_last_material = material;
+
+			rebind_shader = false;
+		}
+
+		int blend_mode = shader_cache ? shader_cache->canvas_item.blend_mode : RasterizerStorageGLES2::Shader::CanvasItem::BLEND_MODE_MIX;
+		bool unshaded = true || (shader_cache && blend_mode != RasterizerStorageGLES2::Shader::CanvasItem::BLEND_MODE_MIX);
+		bool reclip = false;
+
+		if (last_blend_mode != blend_mode) {
+
+			switch (blend_mode) {
+
+				case RasterizerStorageGLES2::Shader::CanvasItem::BLEND_MODE_MIX: {
+					glBlendEquation(GL_FUNC_ADD);
+					if (storage->frame.current_rt && storage->frame.current_rt->flags[RasterizerStorage::RENDER_TARGET_TRANSPARENT]) {
+						glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+					} else {
+						glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+					}
+
+				} break;
+				case RasterizerStorageGLES2::Shader::CanvasItem::BLEND_MODE_ADD: {
+
+					glBlendEquation(GL_FUNC_ADD);
+					glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+
+				} break;
+				case RasterizerStorageGLES2::Shader::CanvasItem::BLEND_MODE_SUB: {
+
+					glBlendEquation(GL_FUNC_REVERSE_SUBTRACT);
+					glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+				} break;
+				case RasterizerStorageGLES2::Shader::CanvasItem::BLEND_MODE_MUL: {
+					glBlendEquation(GL_FUNC_ADD);
+					glBlendFunc(GL_DST_COLOR, GL_ZERO);
+				} break;
+				case RasterizerStorageGLES2::Shader::CanvasItem::BLEND_MODE_PMALPHA: {
+					glBlendEquation(GL_FUNC_ADD);
+					glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+				} break;
+			}
+		}
+
+		state.uniforms.final_modulate = unshaded ? ci->final_modulate : Color(ci->final_modulate.r * p_modulate.r, ci->final_modulate.g * p_modulate.g, ci->final_modulate.b * p_modulate.b, ci->final_modulate.a * p_modulate.a);
+
+		state.uniforms.modelview_matrix = ci->final_transform;
+		state.uniforms.extra_matrix = Transform2D();
+
+		_set_uniforms();
+
+		data.material = material_ptr;
+
+		const int command_count = p_item_list->commands.size();
+		Item::Command *const *commands = p_item_list->commands.ptr();
+
+		for (int i = 0; i < command_count; i++) {
+			Item::Command *command = commands[i];
+
+			data.command_to = i;
+
+			switch (command->type) {
+
+				case Item::Command::TYPE_LINE: {
+					const Item::CommandLine *line = static_cast<Item::CommandLine *>(command);
+
+					if (line->width <= 1) {
+						const int vertex_count = 2;
+						const int index_count = 2;
+
+						_begin(GL_LINES);
+						_prepare(vertex_count, index_count);
+
+						Vertex vertices[vertex_count];
+
+						vertices[0].v = Vector2(line->from.x, line->from.y);
+						vertices[0].c = line->color;
+						vertices[0].uv = Vector2();
+
+						vertices[1].v = Vector2(line->to.x, line->to.y);
+						vertices[1].c = line->color;
+						vertices[1].uv = Vector2();
+
+						memcpy(data.mem_vertex_buffer + data.mem_vertex_buffer_offset, vertices, sizeof(vertices));
+
+						const int indices[index_count] = { 0, 1 };
+
+						memcpy(data.mem_index_buffer + data.mem_index_buffer_offset, indices, sizeof(indices));
+
+						_commit(vertex_count, index_count);
+					} else {
+						const int vertex_count = 4;
+						const int index_count = 6;
+
+						_begin(GL_TRIANGLES);
+						_prepare(vertex_count, index_count);
+
+						Vertex *v = data.mem_vertex_buffer + data.mem_vertex_buffer_offset;
+
+						Vector2 t = (line->from - line->to).normalized().tangent() * line->width * 0.5;
+
+						v[0].v = line->from - t;
+						v[0].c = line->color;
+						v[0].uv = Vector2();
+
+						v[1].v = line->from + t;
+						v[1].c = line->color;
+						v[1].uv = Vector2();
+
+						v[2].v = line->to + t;
+						v[2].c = line->color;
+						v[2].uv = Vector2();
+
+						v[3].v = line->to - t;
+						v[3].c = line->color;
+						v[3].uv = Vector2();
+
+						const int indices[index_count] = {
+							0, 1, 2,
+							2, 3, 0
+						};
+
+						memcpy(data.mem_index_buffer + data.mem_index_buffer_offset, indices, sizeof(indices));
+
+						_commit(vertex_count, index_count);
+					}
+
+				} break;
+
+				case Item::Command::TYPE_RECT: {
+					const int vertex_count = 4;
+					const int index_count = 6;
+
+					_begin(GL_TRIANGLES);
+					_prepare(vertex_count, index_count);
+
+					Item::CommandRect *r = static_cast<Item::CommandRect *>(command);
+
+					Rect2 src_rect;
+					Rect2 dst_rect;
+
+					RasterizerStorageGLES2::Texture *tex = storage->texture_owner.getornull(r->texture);
+
+					if (!tex) {
+						dst_rect = Rect2(r->rect.position, r->rect.size);
+
+						if (dst_rect.size.width < 0) {
+							dst_rect.position.x += dst_rect.size.width;
+							dst_rect.size.width *= -1;
+						}
+						if (dst_rect.size.height < 0) {
+							dst_rect.position.y += dst_rect.size.height;
+							dst_rect.size.height *= -1;
+						}
+
+						src_rect = Rect2(0, 0, 1, 1);
+
+					} else {
+						Size2 texpixel_size(1.0 / tex->width, 1.0 / tex->height);
+
+						src_rect = (r->flags & CANVAS_RECT_REGION) ? Rect2(r->source.position * texpixel_size, r->source.size * texpixel_size) : Rect2(0, 0, 1, 1);
+						dst_rect = Rect2(r->rect.position, r->rect.size);
+
+						if (dst_rect.size.width < 0) {
+							dst_rect.position.x += dst_rect.size.width;
+							dst_rect.size.width *= -1;
+						}
+						if (dst_rect.size.height < 0) {
+							dst_rect.position.y += dst_rect.size.height;
+							dst_rect.size.height *= -1;
+						}
+
+						if (r->flags & CANVAS_RECT_FLIP_H) {
+							src_rect.size.x *= -1;
+							src_rect.position.x -= src_rect.size.width;
+						}
+						if (r->flags & CANVAS_RECT_FLIP_V) {
+							src_rect.size.y *= -1;
+							src_rect.position.y -= src_rect.size.height;
+						}
+						if (r->flags & CANVAS_RECT_TRANSPOSE) {
+							dst_rect.size.x *= -1; // Encoding in the dst_rect.z uniform
+						}
+					}
+
+					Vertex *v = data.mem_vertex_buffer + data.mem_vertex_buffer_offset;
+
+					// 0,0
+					v[0].v = dst_rect.position;
+					v[0].c = r->modulate;
+					v[0].uv = src_rect.position;
+
+					// 0,1
+					v[1].v = Vector2(dst_rect.position.x, dst_rect.position.y + dst_rect.size.y);
+					v[1].c = r->modulate;
+					v[1].uv = Vector2(src_rect.position.x, src_rect.position.y + src_rect.size.y);
+
+					// 1,1
+					v[2].v = Vector2(dst_rect.position.x + dst_rect.size.x, dst_rect.position.y + dst_rect.size.y);
+					v[2].c = r->modulate;
+					v[2].uv = Vector2(src_rect.position.x + src_rect.size.x, src_rect.position.y + src_rect.size.y);
+
+					// 1,0
+					v[3].v = Vector2(dst_rect.position.x + dst_rect.size.x, dst_rect.position.y);
+					v[3].c = r->modulate;
+					v[3].uv = Vector2(src_rect.position.x + src_rect.size.x, src_rect.position.y);
+
+					const int indices[index_count] = {
+						0, 1, 2,
+						2, 3, 0
+					};
+
+					memcpy(data.mem_index_buffer + data.mem_index_buffer_offset, indices, sizeof(int) * index_count);
+
+					_commit(vertex_count, index_count);
+				} break;
+
+				case Item::Command::TYPE_NINEPATCH: {
+					const int vertex_count = 16;
+					const int index_count = 54;
+
+					_begin(GL_TRIANGLES);
+					_prepare(vertex_count, index_count);
+
+					Item::CommandNinePatch *np = static_cast<Item::CommandNinePatch *>(command);
+
+					RasterizerStorageGLES2::Texture *tex = storage->texture_owner.getornull(np->texture);
+
+					if (!tex) {
+						print_line("TODO: ninepatch without texture");
+						continue;
+					}
+
+					Size2 texpixel_size(1.0 / tex->width, 1.0 / tex->height);
+
+					Rect2 source = np->source;
+					if (source.size.x == 0 && source.size.y == 0) {
+						source.size.x = tex->width;
+						source.size.y = tex->height;
+					}
+
+					// prepare vertex buffer
+
+					// this buffer contains [ POS POS UV UV ] *
+
+					Vertex *v = data.mem_vertex_buffer + data.mem_vertex_buffer_offset;
+
+					v[0].v = np->rect.position;
+					v[0].c = np->color;
+					v[0].uv = source.position * texpixel_size;
+
+					v[1].v = np->rect.position + Vector2(np->margin[MARGIN_LEFT], 0);
+					v[1].c = np->color;
+					v[1].uv = (source.position + Vector2(np->margin[MARGIN_LEFT], 0)) * texpixel_size;
+
+					v[2].v = np->rect.position + Vector2(np->rect.size.x - np->margin[MARGIN_RIGHT], 0);
+					v[2].c = np->color;
+					v[2].uv = (source.position + Vector2(source.size.x - np->margin[MARGIN_RIGHT], 0)) * texpixel_size;
+
+					v[3].v = np->rect.position + Vector2(np->rect.size.x, 0);
+					v[3].c = np->color;
+					v[3].uv = (source.position + Vector2(source.size.x, 0)) * texpixel_size;
+
+					v[4].v = np->rect.position + Vector2(0, np->margin[MARGIN_TOP]);
+					v[4].c = np->color;
+					v[4].uv = (source.position + Vector2(0, np->margin[MARGIN_TOP])) * texpixel_size;
+
+					v[5].v = np->rect.position + Vector2(np->margin[MARGIN_LEFT], np->margin[MARGIN_TOP]);
+					v[5].c = np->color;
+					v[5].uv = (source.position + Vector2(np->margin[MARGIN_LEFT], np->margin[MARGIN_TOP])) * texpixel_size;
+
+					v[6].v = np->rect.position + Vector2(np->rect.size.x - np->margin[MARGIN_RIGHT], np->margin[MARGIN_TOP]);
+					v[6].c = np->color;
+					v[6].uv = (source.position + Vector2(source.size.x - np->margin[MARGIN_RIGHT], np->margin[MARGIN_TOP])) * texpixel_size;
+
+					v[7].v = np->rect.position + Vector2(np->rect.size.x, np->margin[MARGIN_TOP]);
+					v[7].c = np->color;
+					v[7].uv = (source.position + Vector2(source.size.x, np->margin[MARGIN_TOP])) * texpixel_size;
+
+					v[8].v = np->rect.position + Vector2(0, np->rect.size.y - np->margin[MARGIN_BOTTOM]);
+					v[8].c = np->color;
+					v[8].uv = (source.position + Vector2(0, source.size.y - np->margin[MARGIN_BOTTOM])) * texpixel_size;
+
+					v[9].v = np->rect.position + Vector2(np->margin[MARGIN_LEFT], np->rect.size.y - np->margin[MARGIN_BOTTOM]);
+					v[9].c = np->color;
+					v[9].uv = (source.position + Vector2(np->margin[MARGIN_LEFT], source.size.y - np->margin[MARGIN_BOTTOM])) * texpixel_size;
+
+					v[10].v = np->rect.position + np->rect.size - Vector2(np->margin[MARGIN_RIGHT], np->margin[MARGIN_BOTTOM]);
+					v[10].c = np->color;
+					v[10].uv = (source.position + source.size - Vector2(np->margin[MARGIN_RIGHT], np->margin[MARGIN_BOTTOM])) * texpixel_size;
+
+					v[11].v = np->rect.position + np->rect.size - Vector2(0, np->margin[MARGIN_BOTTOM]);
+					v[11].c = np->color;
+					v[11].uv = (source.position + source.size - Vector2(0, np->margin[MARGIN_BOTTOM])) * texpixel_size;
+
+					v[12].v = np->rect.position + Vector2(0, np->rect.size.y);
+					v[12].c = np->color;
+					v[12].uv = (source.position + Vector2(0, source.size.y)) * texpixel_size;
+
+					v[13].v = np->rect.position + Vector2(np->margin[MARGIN_LEFT], np->rect.size.y);
+					v[13].c = np->color;
+					v[13].uv = (source.position + Vector2(np->margin[MARGIN_LEFT], source.size.y)) * texpixel_size;
+
+					v[14].v = np->rect.position + np->rect.size - Vector2(np->margin[MARGIN_RIGHT], 0);
+					v[14].c = np->color;
+					v[14].uv = (source.position + source.size - Vector2(np->margin[MARGIN_RIGHT], 0)) * texpixel_size;
+
+					v[15].v = np->rect.position + np->rect.size;
+					v[15].c = np->color;
+					v[15].uv = (source.position + source.size) * texpixel_size;
+
+					memcpy(data.mem_index_buffer + data.mem_index_buffer_offset, data.ninepatch_elements, sizeof(data.ninepatch_elements));
+
+					_commit(vertex_count, index_count - (np->draw_center ? 0 : 6));
+				} break;
+
+				case Item::Command::TYPE_CIRCLE: {
+					Item::CommandCircle *circle = static_cast<Item::CommandCircle *>(command);
+
+					const int num_points = 32;
+
+					Vector2 points[num_points + 1];
+					points[num_points] = circle->pos;
+
+					int indices[num_points * 3];
+
+					for (int i = 0; i < num_points; i++) {
+						points[i] = circle->pos + Vector2(Math::sin(i * Math_PI * 2.0 / num_points), Math::cos(i * Math_PI * 2.0 / num_points)) * circle->radius;
+						indices[i * 3 + 0] = i;
+						indices[i * 3 + 1] = (i + 1) % num_points;
+						indices[i * 3 + 2] = num_points;
+					}
+
+					_draw_polygon(indices, num_points * 3, num_points + 1, points, NULL, &circle->color, true);
+				} break;
+
+				case Item::Command::TYPE_POLYGON: {
+					Item::CommandPolygon *polygon = static_cast<Item::CommandPolygon *>(command);
+
+					const int *indices = polygon->indices.ptr();
+					if (!indices) // self-intersecting polygon
+						break;
+
+					_draw_polygon(indices, polygon->count, polygon->points.size(), polygon->points.ptr(), polygon->uvs.ptr(), polygon->colors.ptr(), polygon->colors.size() == 1);
+				} break;
+
+				case Item::Command::TYPE_POLYLINE: {
+					Item::CommandPolyLine *pline = static_cast<Item::CommandPolyLine *>(command);
+
+					if (pline->triangles.size()) {
+						const int vertex_count = pline->triangles.size();
+						const int triangle_count = vertex_count - 2;
+						const int index_count = triangle_count * 3;
+
+						_begin(GL_TRIANGLES);
+						_prepare(vertex_count, index_count);
+
+						const Vector2 *t = pline->triangles.ptr();
+						Vertex *v = data.mem_vertex_buffer + data.mem_vertex_buffer_offset;
+
+						const Color *colors = pline->triangle_colors.ptr();
+
+						bool single;
+						Color color;
+
+						if (pline->triangle_colors.size() == 1) {
+							single = true;
+							color = *colors;
+						} else if (!colors) {
+							single = true;
+							color = Color(1, 1, 1, 1);
+						} else {
+							single = false;
+						}
+
+						const bool use_single_color = single;
+						const Color single_color = color;
+
+						for (int i = 0; i < vertex_count; ++i) {
+							if (use_single_color)
+								v->c = single_color;
+							else
+								v->c = colors[i];
+
+							v->uv = Vector2();
+							v->v = t[i];
+
+							++v;
+						}
+
+						for (int i = 0; i < triangle_count; ++i) {
+							const int indices[3] = {
+								i, i + 1, i + 2
+							};
+
+							memcpy(data.mem_index_buffer + data.mem_index_buffer_offset + i * 3, indices, sizeof(indices));
+						}
+
+						_commit(vertex_count, index_count);
+					} else {
+						_begin(GL_LINES);
+
+						const Color *colors = pline->line_colors.ptr();
+
+						bool single;
+						Color color;
+
+						if (pline->line_colors.size() == 1) {
+							single = true;
+							color = *colors;
+						} else if (!colors) {
+							single = true;
+							color = Color(1, 1, 1, 1);
+						} else {
+							single = false;
+						}
+
+						const bool use_single_color = single;
+						const Color single_color = color;
+
+						const Vector2 *lines = pline->lines.ptr();
+
+						if (pline->multiline) {
+							const int lines_count = pline->lines.size() / 2;
+
+							for (int i = 0; i < lines_count; ++i) {
+								const int vertex_count = 2;
+								const int index_count = 2;
+
+								_prepare(vertex_count, index_count);
+
+								Vertex *v = data.mem_vertex_buffer + data.mem_vertex_buffer_offset;
+
+								for (int j = 0; j < 2; ++j) {
+									if (use_single_color)
+										v->c = single_color;
+									else
+										v->c = colors[i];
+
+									v->uv = Vector2();
+									v->v = lines[i * 2 + j];
+
+									++v;
+								}
+
+								const int indices[index_count] = { 0, 1 };
+
+								memcpy(data.mem_index_buffer + data.mem_index_buffer_offset, indices, sizeof(indices));
+
+								_commit(vertex_count, index_count);
+							}
+						} else {
+							const int vertex_count = pline->lines.size();
+							const int lines_count = vertex_count - 1;
+							const int index_count = lines_count * 2;
+
+							_prepare(vertex_count, index_count);
+
+							Vertex *v = data.mem_vertex_buffer + data.mem_vertex_buffer_offset;
+
+							for (int i = 0; i < vertex_count; ++i) {
+								if (use_single_color)
+									v->c = single_color;
+								else
+									v->c = colors[i];
+
+								v->uv = Vector2();
+								v->v = lines[i];
+
+								++v;
+							}
+
+							for (int i = 0; i < lines_count; ++i) {
+								const int indices[2] = { i, i + 1 };
+
+								memcpy(data.mem_index_buffer + data.mem_index_buffer_offset + i * 2, indices, sizeof(indices));
+							}
+
+							_commit(vertex_count, index_count);
+						}
+					}
+				} break;
+
+				case Item::Command::TYPE_PRIMITIVE: {
+					Item::CommandPrimitive *primitive = static_cast<Item::CommandPrimitive *>(command);
+
+					const GLenum prim[5] = { GL_POINTS, GL_POINTS, GL_LINES, GL_TRIANGLES, GL_TRIANGLE_FAN };
+
+					ERR_CONTINUE(primitive->points.size() < 1);
+
+					RasterizerStorageGLES2::Texture *texture = storage->texture_owner.getornull(primitive->texture);
+
+					const int vertex_count = primitive->points.size();
+					const int index_count = vertex_count;
+
+					_begin(prim[vertex_count]);
+					_prepare(vertex_count, index_count);
+
+					Vertex *v = data.mem_vertex_buffer + data.mem_vertex_buffer_offset;
+					int *index = data.mem_index_buffer + data.mem_index_buffer_offset;
+
+					Color c;
+					bool single_color;
+
+					const Color *colors = primitive->colors.ptr();
+					const Vector2 *uvs = primitive->uvs.ptr();
+					const Vector2 *points = primitive->points.ptr();
+
+					if (primitive->colors.size() == 1 && primitive->points.size() > 1) {
+						single_color = true;
+						c = primitive->colors[0];
+					} else if (primitive->colors.empty()) {
+						single_color = true;
+						c = Color(1, 1, 1, 1);
+					} else {
+						single_color = false;
+					}
+
+					const bool use_single_color = single_color;
+					const Color color = c;
+
+					for (int i = 0; i < vertex_count; ++i) {
+						if (use_single_color)
+							v->c = color;
+						else
+							v->c = colors[i];
+
+						if (uvs)
+							v->uv = uvs[i];
+						else
+							v->uv = Vector2();
+
+						v->v = points[i];
+
+						index[i] = i;
+
+						++v;
+					}
+
+					_commit(vertex_count, index_count);
+				} break;
+			}
+		}
+
+		// TODO: figure out when to _flush to get better batching results
+		//_flush();
+
+		rebind_shader = true; // hacked in for now.
+
+		if (reclip) {
+			glEnable(GL_SCISSOR_TEST);
+			int y = storage->frame.current_rt->height - (current_clip->final_clip_rect.position.y + current_clip->final_clip_rect.size.y);
+			if (storage->frame.current_rt->flags[RasterizerStorage::RENDER_TARGET_VFLIP])
+				y = current_clip->final_clip_rect.position.y;
+			glScissor(current_clip->final_clip_rect.position.x, y, current_clip->final_clip_rect.size.width, current_clip->final_clip_rect.size.height);
+		}
+
+		p_item_list = p_item_list->next;
+	}
+
+	_flush();
+}
+
+void RasterizerCanvasGLES2::_render_items(Item *p_item_from, const int p_command_from, Item *p_item_to, const int p_command_to) {
+}
+
+void RasterizerCanvasGLES2::_canvas_render_items(Item *p_item_list, int p_z, const Color &p_modulate, Light *p_light, const Transform2D &p_base_transform) {
 	Item *current_clip = NULL;
 
 	RasterizerStorageGLES2::Shader *shader_cache = NULL;
@@ -1026,7 +1722,7 @@ void RasterizerCanvasGLES2::canvas_render_items(Item *p_item_list, int p_z, cons
 		_canvas_item_render_commands(p_item_list, NULL, reclip, material_ptr);
 
 		// TODO: figure out when to _flush to get better batching results
-		_flush();
+		//_flush();
 
 		rebind_shader = true; // hacked in for now.
 
@@ -1041,7 +1737,7 @@ void RasterizerCanvasGLES2::canvas_render_items(Item *p_item_list, int p_z, cons
 		p_item_list = p_item_list->next;
 	}
 
-	_flush();
+	//_flush();
 
 	if (current_clip) {
 		glDisable(GL_SCISSOR_TEST);
@@ -1225,7 +1921,17 @@ RasterizerCanvasGLES2::RasterizerCanvasGLES2() {
 
 void RasterizerCanvasGLES2::_begin(const GLuint p_primitive) {
 	if (data.primitive != p_primitive) {
-		_flush();
+		if (render_commands.index == render_commands.size) {
+			_flush();
+		}
+
+		RenderCommand *rc = &render_commands.commands[render_commands.index++];
+		rc->item = data.item_to;
+		rc->command = data.command_to;
+		rc->vertex_offset = data.mem_vertex_buffer_offset;
+		rc->index_offset = data.mem_index_buffer_offset;
+		rc->primitive = p_primitive;
+
 		data.primitive = p_primitive;
 	}
 }
@@ -1260,37 +1966,125 @@ void RasterizerCanvasGLES2::_draw(const GLuint p_primitive, const int p_vertex_c
 }
 
 void RasterizerCanvasGLES2::_flush() {
-	if (data.mem_vertex_buffer_offset) {
-		_draw(data.primitive, data.mem_vertex_buffer_offset, data.mem_vertex_buffer, data.mem_index_buffer_offset, data.mem_index_buffer);
+	Item *item = data.item_from;
+	int render_index = 0;
+
+	glBindBuffer(GL_ARRAY_BUFFER, data.vertex_buffer);
+	glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(Vertex) * data.mem_vertex_buffer_offset, data.mem_vertex_buffer);
+
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, data.index_buffer);
+	glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, sizeof(int) * data.mem_index_buffer_offset, data.mem_index_buffer);
+
+	while (item != data.item_to->next) {
+		int command_count = item->commands.size();
+		Item::Command **commands = item->commands.ptrw();
+
+		for (int i = 0; i < command_count && (item != data.item_to || i <= data.command_to); ++i) {
+			Item::Command *command = commands[i];
+
+			switch (command->type) {
+				case Item::Command::TYPE_LINE: {
+					_bind_shader(data.material);
+					_bind_canvas_texture(RID(), RID());
+				} break;
+
+				case Item::Command::TYPE_RECT: {
+					Item::CommandRect *r = static_cast<Item::CommandRect *>(command);
+
+					_bind_shader(data.material);
+					RasterizerStorageGLES2::Texture *texture = _bind_canvas_texture(r->texture, r->normal_map);
+
+					if (texture) {
+						Size2 texpixel_size(1.0 / texture->width, 1.0 / texture->height);
+						state.canvas_shader.set_uniform(CanvasShaderGLES2::COLOR_TEXPIXEL_SIZE, texpixel_size);
+					}
+				} break;
+
+				case Item::Command::TYPE_NINEPATCH: {
+					Item::CommandNinePatch *np = static_cast<Item::CommandNinePatch *>(command);
+
+					_bind_shader(data.material);
+					RasterizerStorageGLES2::Texture *texture = _bind_canvas_texture(np->texture, np->normal_map);
+					if (texture) {
+						Size2 texpixel_size(1.0 / texture->width, 1.0 / texture->height);
+						state.canvas_shader.set_uniform(CanvasShaderGLES2::COLOR_TEXPIXEL_SIZE, texpixel_size);
+					}
+				} break;
+
+				case Item::Command::TYPE_CIRCLE: {
+					_bind_shader(data.material);
+				} break;
+
+				case Item::Command::TYPE_POLYGON: {
+					Item::CommandPolygon *polygon = static_cast<Item::CommandPolygon *>(command);
+
+					const int *indices = polygon->indices.ptr();
+					if (!indices) // self-intersecting polygon
+						break;
+
+					_bind_shader(data.material);
+					RasterizerStorageGLES2::Texture *texture = _bind_canvas_texture(polygon->texture, polygon->normal_map);
+
+					if (texture) {
+						Size2 texpixel_size(1.0 / texture->width, 1.0 / texture->height);
+						state.canvas_shader.set_uniform(CanvasShaderGLES2::COLOR_TEXPIXEL_SIZE, texpixel_size);
+					}
+				} break;
+			}
+
+			RenderCommand *rc;
+			while ((rc = &render_commands.commands[render_index]) && rc->item == item && rc->command == i) {
+				const uint8_t *base = ((uint8_t *)0) + rc->vertex_offset * sizeof(Vertex);
+				glBindBuffer(GL_ARRAY_BUFFER, data.vertex_buffer);
+				glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, data.index_buffer);
+
+				glEnableVertexAttribArray(VS::ARRAY_VERTEX);
+				glVertexAttribPointer(VS::ARRAY_VERTEX, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), base);
+
+				glEnableVertexAttribArray(VS::ARRAY_COLOR);
+				glVertexAttribPointer(VS::ARRAY_COLOR, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), base + sizeof(Vector2));
+
+				glEnableVertexAttribArray(VS::ARRAY_TEX_UV);
+				glVertexAttribPointer(VS::ARRAY_TEX_UV, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), base + sizeof(Vector2) + sizeof(Color));
+
+				glDrawElements(rc->primitive, rc->index_count, GL_UNSIGNED_INT, ((uint8_t *)0) + rc->index_offset * sizeof(GLuint));
+
+				glBindBuffer(GL_ARRAY_BUFFER, 0);
+				glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+
+				++render_index;
+			}
+		}
+
+		item = item->next;
 	}
 
 	data.mem_vertex_buffer_offset = 0;
 	data.mem_index_buffer_offset = 0;
+
+	render_commands.index = 0;
+
+	// TODO: this isn't valid because may cause duplicate processing of same commands
+	data.item_from = data.item_to;
+	data.command_from = data.command_to;
 }
 
 void RasterizerCanvasGLES2::_commit(const int p_vertex_count, const int p_index_count) {
 	ERR_FAIL_COND(!p_vertex_count);
 	ERR_FAIL_COND(!p_index_count);
 
-	if (state.uniforms.extra_matrix != state.prev_uniforms.extra_matrix ||
-			state.uniforms.final_modulate != state.prev_uniforms.final_modulate ||
-			state.uniforms.modelview_matrix != state.prev_uniforms.modelview_matrix ||
-			state.uniforms.projection_matrix != state.prev_uniforms.projection_matrix ||
-			state.uniforms.texpixel_size != state.prev_uniforms.texpixel_size ||
-			state.uniforms.time != state.prev_uniforms.time) {
-
-		_set_uniforms();
-		state.prev_uniforms = state.uniforms;
-		_flush();
-	}
+	RenderCommand *rc = &render_commands.commands[render_commands.index];
 
 	const int new_index_offset = data.mem_index_buffer_offset + p_index_count;
 
 	for (int i = data.mem_index_buffer_offset; i < new_index_offset; ++i)
-		data.mem_index_buffer[i] += data.mem_vertex_buffer_offset;
+		data.mem_index_buffer[i] += rc->index_count;
 
 	data.mem_vertex_buffer_offset += p_vertex_count;
 	data.mem_index_buffer_offset = new_index_offset;
+
+	rc->vertex_count += p_vertex_count;
+	rc->index_count += p_index_count;
 }
 
 void RasterizerCanvasGLES2::_untile() {
@@ -1305,7 +2099,7 @@ void RasterizerCanvasGLES2::_bind_shader(RasterizerStorageGLES2::Material *p_mat
 		return;
 	}
 
-	_flush();
+	//_flush();
 
 	if (state.canvas_shader.bind()) {
 		state.canvas_shader.use_material((void *)p_material);
