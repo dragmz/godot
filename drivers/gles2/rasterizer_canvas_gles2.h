@@ -50,35 +50,51 @@ public:
 		Color final_modulate;
 
 		float time;
+
+		Size2 texpixel_size;
+	};
+
+	struct Vertex {
+		Vector2 v;
+		Color c;
+		Vector2 uv;
 	};
 
 	struct Data {
 
-		GLuint canvas_quad_vertices;
-		GLuint polygon_buffer;
-		GLuint polygon_index_buffer;
+		GLuint vertex_buffer;
+		GLuint index_buffer;
 
-		uint32_t polygon_buffer_size;
+		uint32_t vertex_buffer_size;
+		uint32_t index_buffer_size;
 
-		GLuint ninepatch_vertices;
-		GLuint ninepatch_elements;
+		int ninepatch_elements[3 * 2 * 9];
 
+		int *mem_index_buffer;
+		uint32_t mem_index_buffer_offset;
+		uint32_t mem_index_buffer_size;
+
+		Vertex *mem_vertex_buffer;
+		uint32_t mem_vertex_buffer_offset;
+		uint32_t mem_vertex_buffer_size;
+
+		GLuint primitive;
+		GLuint texture;
 	} data;
 
 	struct State {
 		Uniforms uniforms;
-		bool canvas_texscreen_used;
-		CanvasShaderGLES2 canvas_shader;
-		// CanvasShadowShaderGLES3 canvas_shadow_shader;
 
-		bool using_texture_rect;
-		bool using_ninepatch;
+		bool tiled;
+
+		CanvasShaderGLES2 canvas_shader;
 
 		RID current_tex;
-		RID current_normal;
 		RasterizerStorageGLES2::Texture *current_tex_ptr;
 
 		Transform vp;
+		RasterizerCanvas::Item *item;
+		Color modulate;
 
 	} state;
 
@@ -99,14 +115,18 @@ public:
 
 	_FORCE_INLINE_ void _set_texture_rect_mode(bool p_enable, bool p_ninepatch = false);
 
-	_FORCE_INLINE_ void _draw_gui_primitive(int p_points, const Vector2 *p_vertices, const Color *p_colors, const Vector2 *p_uvs);
-	_FORCE_INLINE_ void _draw_polygon(const int *p_indices, int p_index_count, int p_vertex_count, const Vector2 *p_vertices, const Vector2 *p_uvs, const Color *p_colors, bool p_singlecolor);
-	_FORCE_INLINE_ void _draw_generic(GLuint p_primitive, int p_vertex_count, const Vector2 *p_vertices, const Vector2 *p_uvs, const Color *p_colors, bool p_singlecolor);
+	_FORCE_INLINE_ void _begin(const GLuint p_primitive, const int p_vertex_count, const int p_index_count);
+	_FORCE_INLINE_ void _commit(const int p_vertex_count, const int p_index_count);
 
-	_FORCE_INLINE_ void _canvas_item_render_commands(Item *p_item, Item *current_clip, bool &reclip, RasterizerStorageGLES2::Material *p_material);
+	_FORCE_INLINE_ void _flush();
+	_FORCE_INLINE_ void _draw(const GLuint p_primitive, const int p_vertex_count, const Vertex *p_vertices, const int p_index_count, const int *p_indices);
+
+	_FORCE_INLINE_ void _untile();
+
 	_FORCE_INLINE_ void _copy_texscreen(const Rect2 &p_rect);
 
 	virtual void canvas_render_items(Item *p_item_list, int p_z, const Color &p_modulate, Light *p_light, const Transform2D &p_base_transform);
+	void _canvas_render_items(Item *p_item_list, int p_z, const Color &p_modulate, Light *p_light, const Transform2D &p_base_transform);
 	virtual void canvas_debug_viewport_shadows(Light *p_lights_with_shadow);
 
 	virtual void canvas_light_shadow_buffer_update(RID p_buffer, const Transform2D &p_light_xform, int p_light_mask, float p_near, float p_far, LightOccluderInstance *p_occluders, CameraMatrix *p_xform_cache);
@@ -114,8 +134,8 @@ public:
 	virtual void reset_canvas();
 
 	RasterizerStorageGLES2::Texture *_bind_canvas_texture(const RID &p_texture, const RID &p_normal_map);
+	_FORCE_INLINE_ void _bind_shader(RasterizerStorageGLES2::Material *p_material);
 
-	void _bind_quad_buffer();
 	void draw_generic_textured_rect(const Rect2 &p_rect, const Rect2 &p_src);
 
 	void initialize();
@@ -124,6 +144,36 @@ public:
 	virtual void draw_window_margins(int *black_margin, RID *black_image);
 
 	RasterizerCanvasGLES2();
+
+	struct RenderCommand {
+		RasterizerCanvas::Item *item;
+		Color modulate;
+
+		RID texture;
+		struct {
+			Size2 texpixel_size;
+			Transform2D extra_matrix;
+		} uniforms;
+
+		GLuint primitive;
+
+		uint32_t vertex_offset;
+		uint32_t vertex_count;
+
+		uint32_t index_offset;
+		uint32_t index_count;
+	};
+
+	struct RenderCommands {
+		int32_t index;
+		uint32_t size;
+		RenderCommand commands[1024];
+
+		RenderCommands() {
+			index = -1;
+			size = 1024;
+		}
+	} render_commands;
 };
 
 #endif // RASTERIZERCANVASGLES2_H
