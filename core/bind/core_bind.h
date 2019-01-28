@@ -718,6 +718,9 @@ public:
 	void set_editor_hint(bool p_enabled);
 	bool is_editor_hint() const;
 
+	void set_debug(bool p_debug);
+	bool is_debug() const;
+
 	_Engine();
 };
 

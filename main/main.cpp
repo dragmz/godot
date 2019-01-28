@@ -722,6 +722,8 @@ Error Main::setup(const char *execpath, int argc, char *argv[], bool p_second_ph
 		I = N;
 	}
 
+	Engine::get_singleton()->set_debug(debug_mode != "");
+
 	// Network file system needs to be configured before globals, since globals are based on the
 	// 'project.godot' file which will only be available through the network if this is enabled
 	FileAccessNetwork::configure();

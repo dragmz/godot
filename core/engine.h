@@ -71,6 +71,7 @@ private:
 	Map<StringName, Object *> singleton_ptrs;
 
 	bool editor_hint;
+	bool debug;
 
 	static Engine *singleton;
 
@@ -112,9 +113,13 @@ public:
 #ifdef TOOLS_ENABLED
 	_FORCE_INLINE_ void set_editor_hint(bool p_enabled) { editor_hint = p_enabled; }
 	_FORCE_INLINE_ bool is_editor_hint() const { return editor_hint; }
+	_FORCE_INLINE_ void set_debug(bool p_debug) { debug = p_debug; }
+	_FORCE_INLINE_ bool is_debug() const { return debug; }
 #else
 	_FORCE_INLINE_ void set_editor_hint(bool p_enabled) {}
 	_FORCE_INLINE_ bool is_editor_hint() const { return false; }
+	_FORCE_INLINE_ void set_debug(bool p_debug) {}
+	_FORCE_INLINE_ bool is_debug() const { return false; }
 #endif
 
 	Dictionary get_version_info() const;
